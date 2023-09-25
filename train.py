@@ -63,8 +63,10 @@ def setup(args):
         num_classes = 10
     elif args.dataset == "cifar100":
         num_classes = 100
-    elif args.dataset == "inet1k":
-        num_classes = args.num_classes
+    elif 'dogs' in args.dataset:
+        num_classes = 10
+    elif 'trucks' in args.dataset:
+        num_classes = 6
 
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
     model.load_from(np.load(args.pretrained_dir))
@@ -208,7 +210,6 @@ def train(args, model):
                               bar_format="{l_bar}{r_bar}",
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0])
-        breakpoint()
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
@@ -228,8 +229,8 @@ def train(args, model):
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                scheduler.step()
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 
@@ -238,7 +239,7 @@ def train(args, model):
                 )
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
-                    writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
+                    writer.add_scalar("train/lr", scalar_value=scheduler.get_last_lr()[0], global_step=global_step)
                 if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
                     accuracy = valid(args, model, writer, test_loader, global_step)
                     logger.info(f"eval acc at global step={global_step} is {accuracy}")
@@ -271,7 +272,7 @@ def main():
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "inet1k"], default="cifar10",
+    parser.add_argument("--dataset", default="cifar10",
                         help="Which downstream task.")
     parser.add_argument("--dataset_dir", type=str, default="data/inet1k_classes/dogs",
                         help="Where to load the dataset from")
@@ -331,6 +332,7 @@ def main():
     if args.local_rank == -1:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         args.n_gpu = torch.cuda.device_count()
+        print(f'{args.n_gpu = }')
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
