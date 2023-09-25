@@ -4,6 +4,7 @@ import torch
 
 from torchvision import transforms, datasets
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
+from torchvision.datasets import ImageFolder
 
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,7 @@ def get_loader(args):
                                    train=False,
                                    download=True,
                                    transform=transform_test) if args.local_rank in [-1, 0] else None
-
-    else:
+    elif args.dataset == "cifar100":
         trainset = datasets.CIFAR100(root="./data",
                                      train=True,
                                      download=True,
@@ -43,6 +43,12 @@ def get_loader(args):
                                     train=False,
                                     download=True,
                                     transform=transform_test) if args.local_rank in [-1, 0] else None
+    elif "inet1k" in args.dataset:
+        dataset = ImageFolder(root=args.dataset_dir, transform=transform_train)
+        trainset, testset = torch.utils.data.random_split(dataset, [0.8,0.2])
+
+        testset.dataset.transform = transform_test
+
     if args.local_rank == 0:
         torch.distributed.barrier()
 

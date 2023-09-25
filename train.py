@@ -7,7 +7,7 @@ import os
 import random
 import numpy as np
 
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 import torch
 import torch.distributed as dist
@@ -48,9 +48,9 @@ def simple_accuracy(preds, labels):
     return (preds == labels).mean()
 
 
-def save_model(args, model):
+def save_model(args, model, ckpt_name='checkpoint'):
     model_to_save = model.module if hasattr(model, 'module') else model
-    model_checkpoint = os.path.join(args.output_dir, "%s_checkpoint.bin" % args.name)
+    model_checkpoint = os.path.join(args.output_dir, f"{args.name}_{ckpt_name}.bin")
     torch.save(model_to_save.state_dict(), model_checkpoint)
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
 
@@ -59,7 +59,12 @@ def setup(args):
     # Prepare model
     config = CONFIGS[args.model_type]
 
-    num_classes = 10 if args.dataset == "cifar10" else 100
+    if args.dataset == "cifar10":
+        num_classes = 10
+    elif args.dataset == "cifar100":
+        num_classes = 100
+    elif args.dataset == "inet1k":
+        num_classes = args.num_classes
 
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
     model.load_from(np.load(args.pretrained_dir))
@@ -139,6 +144,19 @@ def valid(args, model, writer, test_loader, global_step):
 
 
 def train(args, model):
+
+    # create the log dirs
+    args.output_dir = f"{args.output_dir}/{args.name}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Setup logging
+    logging.basicConfig(filename=os.path.join(args.output_dir, 'log.log'),
+                        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                        datefmt='%m/%d/%Y %H:%M:%S',
+                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
+                   (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
+
     """ Train the model """
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -190,6 +208,7 @@ def train(args, model):
                               bar_format="{l_bar}{r_bar}",
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0])
+        breakpoint()
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
@@ -222,10 +241,14 @@ def train(args, model):
                     writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
                 if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
                     accuracy = valid(args, model, writer, test_loader, global_step)
+                    logger.info(f"eval acc at global step={global_step} is {accuracy}")
                     if best_acc < accuracy:
                         save_model(args, model)
                         best_acc = accuracy
                     model.train()
+
+                if global_step % args.save_every == 0 and args.local_rank in [-1, 0]:
+                    save_model(args, model, ckpt_name=f'e{global_step}')
 
                 if global_step % t_total == 0:
                     break
@@ -233,10 +256,14 @@ def train(args, model):
         if global_step % t_total == 0:
             break
 
-    if args.local_rank in [-1, 0]:
-        writer.close()
     logger.info("Best Accuracy: \t%f" % best_acc)
     logger.info("End Training!")
+    # save the model
+    if args.local_rank in [-1, 0]:
+        save_model(args, model, ckpt_name=f'final_ckpt')
+        accuracy = valid(args, model, writer, test_loader, global_step)
+        logger.info(f'final eval accuracy = {accuracy}')
+        writer.close()
 
 
 def main():
@@ -244,8 +271,10 @@ def main():
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10",
+    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "inet1k"], default="cifar10",
                         help="Which downstream task.")
+    parser.add_argument("--dataset_dir", type=str, default="data/inet1k_classes/dogs",
+                        help="Where to load the dataset from")
     parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
                                                  "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
                         default="ViT-B_16",
@@ -263,6 +292,9 @@ def main():
                         help="Total batch size for eval.")
     parser.add_argument("--eval_every", default=100, type=int,
                         help="Run prediction on validation set every so many steps."
+                             "Will always run one evaluation at the end of training.")
+    parser.add_argument("--save_every", default=500, type=int,
+                        help="save the checkpoint every few steps."
                              "Will always run one evaluation at the end of training.")
 
     parser.add_argument("--learning_rate", default=3e-2, type=float,
@@ -306,13 +338,6 @@ def main():
                                              timeout=timedelta(minutes=60))
         args.n_gpu = 1
     args.device = device
-
-    # Setup logging
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
-                   (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
 
     # Set seed
     set_seed(args)
