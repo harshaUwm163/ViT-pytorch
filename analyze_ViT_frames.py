@@ -170,11 +170,17 @@ if __name__ == '__main__':
     # Model & Tokenizer Setup
     args, model = setup(args)
 
-    model.load_state_dict(torch.load('output/inet1k_dogs-2023-09-24-20-36-49/inet1k_dogs_final_ckpt.bin'))
+    breakpoint()
+    # model.load_state_dict(torch.load('output/inet1k_dogs-2023-09-24-20-36-49/inet1k_dogs_final_ckpt.bin'))
+    model.load_state_dict(torch.load('output/inet1k_trucks-2023-09-24-20-47-28/inet1k_trucks_final_ckpt.bin'))
 
     breakpoint()
 
-    # k = 
-    # l = 
+    # matrix to analyize
+    wmat = model.transformer.encoder.layer[5].attn.key.weight.data
+    k_attn = 768
+    l_attn = 2
     n_attn = 768
-    # tffs = construct_real_tff(k, l // 2, n // 2).permute(0,2,1)
+    tffs = construct_real_tff(k_attn, l_attn // 2, n_attn // 2).to(args.device)
+    projs = torch.matmul(tffs, wmat)
+    norms = torch.norm(projs, dim=(1,2))

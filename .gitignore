@@ -150,3 +150,4 @@ checkpoint/
 data/
 logs/
 output/
+*.png
