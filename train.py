@@ -67,6 +67,12 @@ def setup(args):
         num_classes = 10
     elif 'trucks' in args.dataset:
         num_classes = 6
+    elif 'cats' in args.dataset:
+        num_classes = 6
+    elif 'birds' in args.dataset:
+        num_classes = 10
+    elif 'snakes' in args.dataset:
+        num_classes = 10
 
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
     model.load_from(np.load(args.pretrained_dir))
@@ -141,7 +147,9 @@ def valid(args, model, writer, test_loader, global_step):
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % accuracy)
 
-    writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
+    if writer is not None:
+        print('writing')
+        writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
     return accuracy
 
 
