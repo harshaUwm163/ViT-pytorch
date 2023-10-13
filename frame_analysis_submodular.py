@@ -1,11 +1,13 @@
-from train import *
-from addict import Dict
-import logging
+from train import setup,valid, set_seed
+from apex import amp
+import torch
+import argparse
 from utils.construct_tff import construct_real_tff
 import matplotlib.pyplot as plt
 from utils.data_utils import get_loader
-
-logger = logging.getLogger(__name__)
+import os
+from datetime import timedelta, datetime
+import numpy as np
 
 def main():
     parser = argparse.ArgumentParser()
@@ -69,6 +71,10 @@ def main():
     parser.add_argument('--ckpt_path', type=str, default=None,
                         help="Path to the trained model ckpt")
     args = parser.parse_args()
+    args.output_dir = f"{args.output_dir}/{args.name}-frame_analysis-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    print('running frame analysis python script')
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1:
@@ -88,18 +94,21 @@ def main():
 
     # TODO- change the model to DDP
     args, model = setup(args)
+    if args.fp16:
+        model = amp.initialize( models=model,
+                                opt_level=args.fp16_opt_level)
+        amp._amp_state.loss_scalers[0]._loss_scale = 2**20
     if args.ckpt_path is not None:
         model.load_state_dict(torch.load(args.ckpt_path))
     
     train_loader, test_loader = get_loader(args)
 
     # TODO- change the k,l values
-    k_attn = 2
-    l_attn = 6144
+    k_attn = 64
+    l_attn = 384
     n_attn = 768
     # TODO- transpose the Frames
-    tffs = construct_real_tff(k_attn, l_attn // 2, n_attn // 2).to(args.device)
-    breakpoint()
+    tffs = construct_real_tff(k_attn, l_attn // 2, n_attn // 2).permute(0,2,1).to(args.device)
 
     with torch.no_grad():
         tffs_projs_dict = {}
@@ -108,7 +117,7 @@ def main():
         for (name, param) in model.named_parameters():
             if 'attn' in name:
                 if 'weight' in name:
-                    projs = torch.matmul(tffs, param.weight)
+                    projs = torch.matmul(tffs.permute(0,2,1), param)
                     tffs_projs_dict[name] = projs
                     tffs_enabled_frames[name] = []
                     tffs_disabled_frames[name] = list(range(k_attn))
@@ -119,13 +128,16 @@ def main():
             # run the submodular optimization
             val_accs = []
             for v_i in range(num_disabled_frames):
-                for name, params in model.named_parameters():
+                for name, param in model.named_parameters():
                     if 'attn' in name:
                         if 'weight' in name:
-                                frames_enabled = tffs_enabled_frames[name]
-                                enabled_frames_contrib = torch.matmul(tffs[frames_enabled], tffs_projs_dict[name]).sum(0)
+                                if k_i != 0:
+                                    frames_enabled = tffs_enabled_frames[name]
+                                    enabled_frames_contrib = torch.matmul(tffs[frames_enabled], tffs_projs_dict[name][frames_enabled]).sum(0)
+                                else: 
+                                    enabled_frames_contrib = 0.
                                 disabled_frames_contrib = torch.matmul(tffs[tffs_disabled_frames[name][v_i]], tffs_projs_dict[name][v_i])
-                                param.weight.data = enabled_frames_contrib + disabled_frames_contrib # add all the best ones and the new one
+                                param.data = enabled_frames_contrib + disabled_frames_contrib # add all the best ones and the new one
                 val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
                 val_accs.append(val_acc)
 
@@ -144,3 +156,43 @@ def main():
             # book keeping and repeat
             opt_res_dict[k_i] = va_max
 
+            # logging
+            mdict = {'k_attn': k_attn,
+                    'l_attn': l_attn,
+                    'n_attn': n_attn,
+                    'args': args,
+                    'tffs_enabled_frames': tffs_enabled_frames,
+                    'tffs_disabled_frames': tffs_disabled_frames,
+                    'opt_res_dict' : opt_res_dict,
+                    'val_accs' : val_accs
+                    }
+            torch.save(mdict, os.path.join(args.output_dir, 'results.pt'))
+            plt.plot(opt_res_dict.keys(), opt_res_dict.values())
+            plt.savefig(os.path.join(args.output_dir, f'valAcc_vs_ki.png'))
+            plt.close()
+
+        # final_model
+        for name, param in model.named_parameters():
+            if 'attn' in name:
+                if 'weight' in name:
+                        frames_enabled = tffs_enabled_frames[name]
+                        enabled_frames_contrib = torch.matmul(tffs[frames_enabled], tffs_projs_dict[name][frames_enabled]).sum(0)
+                        param.data = enabled_frames_contrib
+        val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
+        print(f'final validation accuracy = {val_acc}')
+
+        mdict = {'k_attn': k_attn,
+                 'l_attn': l_attn,
+                 'n_attn': n_attn,
+                 'args': args,
+                 'tffs_enabled_frames': tffs_enabled_frames,
+                 'tffs_disabled_frames': tffs_disabled_frames,
+                 'opt_res_dict' : opt_res_dict,
+                 }
+        torch.save(mdict, os.path.join(args.output_dir, 'final_res.pt'))
+
+    breakpoint()
+        
+
+if __name__ == '__main__':
+    main()
