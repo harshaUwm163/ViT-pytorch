@@ -9,6 +9,8 @@ import os
 from datetime import timedelta, datetime
 import numpy as np
 
+from utils.func_utils import PriorityQueue
+
 def main():
     parser = argparse.ArgumentParser()
     # Required parameters
@@ -100,6 +102,9 @@ def main():
         amp._amp_state.loss_scalers[0]._loss_scale = 2**20
     if args.ckpt_path is not None:
         model.load_state_dict(torch.load(args.ckpt_path))
+
+    # this model is for comparing the val acc on the right hand side for the heuristic method
+    model_2 = torch.clone(model)
     
     train_loader, test_loader = get_loader(args)
 
@@ -122,87 +127,103 @@ def main():
                     tffs_weights_dict[name] = param.data.clone()
                     tffs_enabled_frames[name] = []
                     tffs_rank_ki[name] = []
-                    tffs_disabled_frames[name] = list(range(k_attn))
+                    tffs_disabled_frames[name] = PriorityQueue()
 
-        num_disabled_frames = k_attn
-        opt_res_dict = {}
+        # populate the queue
+        # TODO- maybe need to to k_attn * l_attn here
         for k_i in range(k_attn):
-            print(f'added frame {k_i}/{k_attn}')
-            # run the submodular optimization
-            val_accs = []
-            for v_i in range(num_disabled_frames):
-                for name, param in model.named_parameters():
-                    if 'attn' in name:
-                        if 'weight' in name:
-                            # if k_i != 0:
-                            #     frames_enabled = tffs_enabled_frames[name]
-                            #     enabled_frames_contrib = torch.matmul(tffs[frames_enabled], tffs_projs_dict[name][frames_enabled]).sum(0)
-                            # else: 
-                            #     enabled_frames_contrib = 0.
-                            # disabled_frames_contrib = torch.matmul(tffs[tffs_disabled_frames[name][v_i]], tffs_projs_dict[name][v_i])
-                            # breakpoint()
-                            if k_i != 0:
-                                frames_enabled = tffs[tffs_enabled_frames[name]].permute(0,2,1).view(-1,n_attn).permute(1,0)
-                                frames_cat = torch.cat((frames_enabled, tffs[tffs_disabled_frames[name][v_i]]), dim=1)
-                            else:
-                                frames_cat = tffs[tffs_disabled_frames[name][v_i]]
-                            param.data = frames_cat @ torch.linalg.lstsq(frames_cat, tffs_weights_dict[name])[0] # add all the best ones and the new one
-                val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
-                val_accs.append(val_acc)
-
-            # get the max valid acc
-            va_max = np.max(val_accs)
-            va_amax = np.argmax(val_accs)
-            # update the used and unused frames with that particular index
-            for name, params in model.named_parameters():
+            for name, param in model.named_parameters():
                 if 'attn' in name:
                     if 'weight' in name:
-                        rem_idx = tffs_disabled_frames[name].pop(va_amax)
-                        tffs_enabled_frames[name].append(rem_idx)
-                        frames_enabled = tffs[tffs_enabled_frames[name]].permute(0,2,1).view(-1,n_attn).permute(1,0)
-                        tffs_rank_ki[name] = torch.linalg.matrix_rank(frames_enabled)
-            # we are updating one frame at a time, so, decrement the num_disabled_frames by 1
-            num_disabled_frames -= 1
+                        frames_cat = tffs[k_i]
+                        param.data = frames_cat @ torch.linalg.lstsq(frames_cat, tffs_weights_dict[name])[0] # add all the best ones and the new one
+            val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
+            tffs_disabled_frames[name].push((k_i, val_acc))
 
-            # book keeping and repeat
-            opt_res_dict[k_i] = va_max
-            print(f'{k_i = }, {va_max = }')
-
-            # logging
-            mdict = {'k_attn': k_attn,
-                    'l_attn': l_attn,
-                    'n_attn': n_attn,
-                    'args': args,
-                    'tffs_enabled_frames': tffs_enabled_frames,
-                    'tffs_disabled_frames': tffs_disabled_frames,
-                    'opt_res_dict' : opt_res_dict,
-                    'val_accs' : val_accs, 
-                    'tffs_rank_ki': tffs_rank_ki
-                    }
-            torch.save(mdict, os.path.join(args.output_dir, 'results.pt'))
-            plt.plot(opt_res_dict.keys(), opt_res_dict.values())
-            plt.savefig(os.path.join(args.output_dir, f'valAcc_vs_ki.png'))
-            plt.close()
-
-        # final_model
+        # pop the frame with the best accuracy and enable it
         for name, param in model.named_parameters():
             if 'attn' in name:
                 if 'weight' in name:
-                        frames_cat = tffs[tffs_enabled_frames[name]].permute(0,2,1).view(-1,n_attn).permute(1,0)
-                        param.data = frames_cat @ torch.linalg.lstsq(frames_cat, tffs_weights_dict[name])[0] # add all the best ones and the new one
-        val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
-        print(f'final validation accuracy = {val_acc}')
+                    frame_idx,val_acc = tffs_disabled_frames[name].pop()
+                    tffs_enabled_frames[name].append(frame_idx)
 
-        mdict = {'k_attn': k_attn,
-                 'l_attn': l_attn,
-                 'n_attn': n_attn,
-                 'args': args,
-                 'tffs_enabled_frames': tffs_enabled_frames,
-                 'tffs_disabled_frames': tffs_disabled_frames,
-                 'opt_res_dict' : opt_res_dict,
-                 'tffs_rank_ki': tffs_rank_ki
+        num_disabled_frames = k_attn - 1
+        opt_res_dict = [val_acc]
+        curr_frames = {}
+        timeout = 2*k_attn # TODO- multi with l_attn here
+        # add the last one directly
+        while num_disabled_frames > 1 and timeout > 0:
+            for name, param in model.named_parameters():
+                if 'attn' in name and 'weight' in name:
+                    curr_frame_id,_ = tffs_disabled_frames[name].pop()
+                    next_frame_id,_ = tffs_disabled_frames[name].top()
+                    curr_frames[name] = curr_frame_id
+                    # enabled frames are the same for both the models
+                    frames_enabled = tffs[tffs_enabled_frames[name]].permute(0,2,1).view(-1,n_attn).permute(1,0)
+                    # update the param of the model
+                    frames_cat = torch.cat((frames_enabled, tffs[curr_frame_id]), dim=1)
+                    param.data = frames_cat @ torch.linalg.lstsq(frames_cat, tffs_weights_dict[name])[0] # add all the best ones and the new one
+                    # update the param of the comparision model
+                    frames_cat = torch.cat((frames_enabled, tffs[next_frame_id]), dim=1)
+                    param2 = model_2.get_parameter(name)
+                    param2.data = frames_cat @ torch.linalg.lstsq(frames_cat, tffs_weights_dict[name])[0] # add all the best ones and the new one
+            
+            # get the val accuracies for both the models
+            val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
+            val_acc2 = valid(args, model_2, writer=None, test_loader=test_loader, global_step=0)
+            # check if the val accuracy with current frame is better than next one
+            if val_acc >= val_acc2:
+                # add the current frames to the list of frames
+                for name, param in model.named_parameters():
+                    if 'attn' in name and 'weight' in name:
+                        tffs_enabled_frames[name].append(curr_frames[name])
+                num_disabled_frames -= 1
+                opt_res_dict.append(val_acc)
+
+                # logging
+                mdict = {'k_attn': k_attn,
+                        'l_attn': l_attn,
+                        'n_attn': n_attn,
+                        'args': args,
+                        'tffs_enabled_frames': tffs_enabled_frames,
+                        'tffs_disabled_frames': tffs_disabled_frames,
+                        'opt_res_dict' : opt_res_dict,
+                        }
+                torch.save(mdict, os.path.join(args.output_dir, 'results.pt'))
+                plt.plot(opt_res_dict)
+                plt.savefig(os.path.join(args.output_dir, f'valAcc_vs_ki.png'))
+                plt.close()
+            else:
+                # add the current frames back to the list with updated accuracies
+                for name, param in model.named_parameters():
+                    if 'attn' in name and 'weight' in name:
+                        tffs_disabled_frames[name].append((curr_frames[name], val_acc))
+
+            # update the counters
+            timeout -= 1
+
+        # append the last frame if the algo hasn't timed out yet
+        if num_disabled_frames == 1:
+            for name, param in model.named_parameters():
+                if 'attn' in name and 'weight' in name:
+                    curr_frame_id,_ = tffs_disabled_frames[name].pop()
+                    tffs_enabled_frames[name].append(curr_frame_id)
+                    # update the param of the model
+                    frames_enabled = tffs[tffs_enabled_frames[name]].permute(0,2,1).view(-1,n_attn).permute(1,0)
+                    frames_cat = torch.cat((frames_enabled, tffs[curr_frame_id]), dim=1)
+                    param.data = frames_cat @ torch.linalg.lstsq(frames_cat, tffs_weights_dict[name])[0] # add all the best ones and the new one
+            val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
+            opt_res_dict.append(val_acc)
+
+            mdict = {   'k_attn': k_attn,
+                        'l_attn': l_attn,
+                        'n_attn': n_attn,
+                        'args': args,
+                        'tffs_enabled_frames': tffs_enabled_frames,
+                        'tffs_disabled_frames': tffs_disabled_frames,
+                        'opt_res_dict' : opt_res_dict,
                  }
-        torch.save(mdict, os.path.join(args.output_dir, 'final_res.pt'))
+            torch.save(mdict, os.path.join(args.output_dir, 'final_res.pt'))
 
     breakpoint()
         
