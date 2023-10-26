@@ -177,6 +177,12 @@ def train(args, model):
     # Prepare dataset
     train_loader, test_loader = get_loader(args)
 
+    if args.linProbe:
+        print('linear Probing')
+        for name, param in model.named_parameters():
+            if 'head' not in name:
+                param.requires_grad = False
+
     # Prepare optimizer and scheduler
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.learning_rate,
@@ -334,6 +340,8 @@ def main():
                         help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
+    parser.add_argument('--linProbe', action='store_true',default=False,
+                        help="perform linProbe instead of finetune")
     args = parser.parse_args()
 
     # Setup CUDA, GPU & distributed training

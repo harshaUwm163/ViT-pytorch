@@ -1,4 +1,5 @@
-from train import setup,valid, set_seed
+from models.modeling import VisionTransformer, CONFIGS
+from train import valid, set_seed
 from apex import amp
 import torch
 import argparse
@@ -8,6 +9,38 @@ from utils.data_utils import get_loader
 import os
 from datetime import timedelta, datetime
 import numpy as np
+
+def setup(args):
+    # Prepare model
+    config = CONFIGS[args.model_type]
+
+    if args.dataset == "cifar10":
+        num_classes = 10
+    elif args.dataset == "cifar100":
+        num_classes = 100
+    elif 'dogs' in args.dataset:
+        num_classes = 10
+    elif 'trucks' in args.dataset:
+        num_classes = 6
+    elif 'cats' in args.dataset:
+        num_classes = 6
+    elif 'birds' in args.dataset:
+        num_classes = 10
+    elif 'snakes' in args.dataset:
+        num_classes = 10
+
+    model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, vis=True)
+    model.load_from(np.load(args.pretrained_dir))
+    model.to(args.device)
+    num_params = count_parameters(model)
+
+    print(num_params)
+    return args, model
+
+
+def count_parameters(model):
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return params/1000000
 
 def main():
     parser = argparse.ArgumentParser()
@@ -104,28 +137,30 @@ def main():
     train_loader, test_loader = get_loader(args)
 
     # TODO- change the k,l values
-    k_attn = 64
-    l_attn = 384
+    k_attn = 128
+    l_attn = 48
     n_attn = 768
-    # TODO- transpose the Frames
     tffs = construct_real_tff(k_attn, l_attn // 2, n_attn // 2).permute(0,2,1).to(args.device)
+    print('At the breakpoint')
+    val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
+    breakpoint()
 
     with torch.no_grad():
         tffs_weights_dict = {}
         tffs_enabled_frames = {}
         tffs_disabled_frames = {}
-        tffs_rank_ki = {}
         for (name, param) in model.named_parameters():
             if 'attn' in name:
                 if 'weight' in name:
                     projs = torch.matmul(tffs.permute(0,2,1), param)
                     tffs_weights_dict[name] = param.data.clone()
                     tffs_enabled_frames[name] = []
-                    tffs_rank_ki[name] = []
                     tffs_disabled_frames[name] = list(range(k_attn))
 
         num_disabled_frames = k_attn
         opt_res_dict = {}
+        avg_norm_ki = []
+        avg_rank_ki = []
         for k_i in range(k_attn):
             print(f'added frame {k_i}/{k_attn}')
             # run the submodular optimization
@@ -134,13 +169,6 @@ def main():
                 for name, param in model.named_parameters():
                     if 'attn' in name:
                         if 'weight' in name:
-                            # if k_i != 0:
-                            #     frames_enabled = tffs_enabled_frames[name]
-                            #     enabled_frames_contrib = torch.matmul(tffs[frames_enabled], tffs_projs_dict[name][frames_enabled]).sum(0)
-                            # else: 
-                            #     enabled_frames_contrib = 0.
-                            # disabled_frames_contrib = torch.matmul(tffs[tffs_disabled_frames[name][v_i]], tffs_projs_dict[name][v_i])
-                            # breakpoint()
                             if k_i != 0:
                                 frames_enabled = tffs[tffs_enabled_frames[name]].permute(0,2,1).view(-1,n_attn).permute(1,0)
                                 frames_cat = torch.cat((frames_enabled, tffs[tffs_disabled_frames[name][v_i]]), dim=1)
@@ -153,6 +181,11 @@ def main():
             # get the max valid acc
             va_max = np.max(val_accs)
             va_amax = np.argmax(val_accs)
+
+            # avg norm and avg rank
+            avg_norm = 0.
+            avg_rank = 0.
+            num_params = 0
             # update the used and unused frames with that particular index
             for name, params in model.named_parameters():
                 if 'attn' in name:
@@ -160,13 +193,21 @@ def main():
                         rem_idx = tffs_disabled_frames[name].pop(va_amax)
                         tffs_enabled_frames[name].append(rem_idx)
                         frames_enabled = tffs[tffs_enabled_frames[name]].permute(0,2,1).view(-1,n_attn).permute(1,0)
-                        tffs_rank_ki[name] = torch.linalg.matrix_rank(frames_enabled)
+
+                        proj_data = frames_cat @ torch.linalg.lstsq(frames_cat, tffs_weights_dict[name])[0] # add all the best ones and the new one
+                        avg_rank += torch.linalg.matrix_rank(frames_enabled)
+                        avg_norm += torch.norm(proj_data)
+                        num_params += 1
+            avg_norm_ki.append(avg_norm/ num_params)
+            avg_rank_ki.append(avg_rank/ num_params)
             # we are updating one frame at a time, so, decrement the num_disabled_frames by 1
             num_disabled_frames -= 1
 
             # book keeping and repeat
             opt_res_dict[k_i] = va_max
             print(f'{k_i = }, {va_max = }')
+            print(f'{k_i = }, {avg_norm_ki[-1] = }')
+            print(f'{k_i = }, {avg_rank_ki[-1] = }')
 
             # logging
             mdict = {'k_attn': k_attn,
@@ -177,7 +218,8 @@ def main():
                     'tffs_disabled_frames': tffs_disabled_frames,
                     'opt_res_dict' : opt_res_dict,
                     'val_accs' : val_accs, 
-                    'tffs_rank_ki': tffs_rank_ki
+                    'avg_norm_ki': avg_norm_ki,
+                    'avg_rank_ki': avg_rank_ki
                     }
             torch.save(mdict, os.path.join(args.output_dir, 'results.pt'))
             plt.plot(opt_res_dict.keys(), opt_res_dict.values())
@@ -200,7 +242,8 @@ def main():
                  'tffs_enabled_frames': tffs_enabled_frames,
                  'tffs_disabled_frames': tffs_disabled_frames,
                  'opt_res_dict' : opt_res_dict,
-                 'tffs_rank_ki': tffs_rank_ki
+                 'avg_norm_ki': avg_norm_ki,
+                 'avg_rank_ki': avg_rank_ki
                  }
         torch.save(mdict, os.path.join(args.output_dir, 'final_res.pt'))
 

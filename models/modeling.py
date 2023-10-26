@@ -182,6 +182,7 @@ class Block(nn.Module):
         x = self.attention_norm(x)
         x, weights = self.attn(x)
         x = x + h
+        breakpoint()
 
         h = x
         x = self.ffn_norm(x)

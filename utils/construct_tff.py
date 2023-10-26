@@ -56,7 +56,7 @@ def construct_tight_frames(k,l,n):
     # part 2 - Modulated TFFs
     tffs = []
     for _k in range(k):
-        wt_mat = torch.as_tensor([2*math.pi*(_k-1)*_n/k for _n in range(n)])
+        wt_mat = torch.as_tensor([2*math.pi*(_k)*_n/k for _n in range(n)])
         tffs.append(torch.polar(tff_lxn, wt_mat))
     # tffs = torch.stack(tffs,0) * math.sqrt(l/n)
     tffs = torch.stack(tffs,0) * math.sqrt(1/k)
@@ -83,8 +83,8 @@ if __name__ == "__main__":
     # # construct TFFs
     # tffs = construct_tight_frames(k,l,n)
 
-    k = 3
-    l = 2
-    n = 6
+    k = 256
+    l = 96
+    n = 768
     tffs = construct_real_tff(k,l,n)
 
