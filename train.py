@@ -98,7 +98,6 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-
 def valid(args, model, writer, test_loader, global_step):
     # Validation!
     eval_losses = AverageMeter()
