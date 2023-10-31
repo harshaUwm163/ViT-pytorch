@@ -173,9 +173,9 @@ class Block(nn.Module):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)
+        self.attn = Attention(config, vis)
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn = Mlp(config)
-        self.attn = Attention(config, vis)
 
     def forward(self, x):
         h = x

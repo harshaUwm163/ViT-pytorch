@@ -21,7 +21,6 @@ def count_parameters(model):
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return params/1000000
 
-
 parser = argparse.ArgumentParser()
 # Required parameters
 parser.add_argument("--exp_name", type=str, default='debug_thread',
@@ -107,10 +106,8 @@ def quantize_qfna(x, scale, zero, maxq):
     return scale * (q - zero)
 
 # This is with the Weiner Filter based estimation
-# redundancies = [1,2,3,4,5]
-# bws = [2,3,4,8,16,32]
-redundancies = [1,2,3,4]
-bws = [2,3,4,8]
+redundancies = [1]
+bws = [2,3,4,8,12,16]
 
 val_accs = {}
 compressions = {}
@@ -157,6 +154,8 @@ for redundancy in redundancies:
                 elif 'patch_embeddings.weight' in name:
                     wmat = wmat.view(768,-1)
                 
+                wmean = wmat.mean(dim=1, keepdim=True)
+                wmat = wmat - wmean
                 tff_n = wmat.shape[0]
                 projs = torch.matmul(tffs[tff_n], wmat)
                 num_frames = projs.shape[0]*projs.shape[1]
@@ -169,12 +168,18 @@ for redundancy in redundancies:
                 if args.coef_est_type == 'weiner':
                     # compute the weiner filter
                     z = projs_qntzd.view(num_frames, -1)
-                    Rxz = wmat @ z.T
-                    Rzz = z @ z.T
-                    wmat_est = Rxz @ torch.linalg.pinv(Rzz) @ z
-                    wmat_est = wmat_est.squeeze()
+                    p = projs.view(num_frames, -1)
+                    n = p-z
+                    var_x = (wmat**2).mean(dim=1)
+                    var_n = (n**2).mean(dim=1)
+                    Rxz = torch.diag(var_x) @ tffs[tff_n].view(-1,tff_n).T
+                    Rzz = tffs[tff_n].view(-1,tff_n) @ torch.diag(var_x) @ tffs[tff_n].view(-1,tff_n).T + var_n
+                    wmat_est = (Rxz @ torch.linalg.pinv(Rzz) @ z).squeeze()
                 elif args.coef_est_type == 'naive':
                     wmat_est = (tffs[tff_n].view(-1,tff_n).T @ projs_qntzd.view(num_frames, -1)).squeeze()
+
+                # add the mean back
+                wmat_est += wmean
 
                 if 'patch_embeddings.weight' in name:
                     wmat_est = wmat_est.view(768,3,16,16)
