@@ -112,7 +112,7 @@ def valid(args, model, writer, test_loader, global_step):
         writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
     return accuracy
 
-@torch.no_grad()
+# @torch.no_grad()
 def quantize_vit(model, dataloader, dev, args):
     print('Starting ...')
 
@@ -167,6 +167,10 @@ def quantize_vit(model, dataloader, dev, args):
         for name in subset:
             print(i, name)
             print(f'Quantizing {name} ...')
+            # quant_method[name].preproc(
+            #         preproc_gptqH=args.pre_gptqH, percdamp=args.percdamp,
+            #         preproc_rescale=args.pre_rescale, 
+            #         preproc_proj=args.pre_proj, preproc_proj_extra=args.pre_proj_extra)
             gptq[name].fasterquant(
                 percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
             )
@@ -323,9 +327,9 @@ if __name__ == '__main__':
 
     # Prepare dataset
     train_loader, test_loader = get_loader(args)
-    val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
-    print(f'initial val acc = {val_acc}')
-    logging.info(f'initial val acc = {val_acc}')
+    # val_acc = valid(args, model, writer=None, test_loader=test_loader, global_step=0)
+    # print(f'initial val acc = {val_acc}')
+    # logging.info(f'initial val acc = {val_acc}')
 
     orig_wt = model.transformer.encoder.layer[0].ffn.fc1.weight.data.clone()
     if args.wbits <= 16 and not args.nearest:
