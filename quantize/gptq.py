@@ -28,8 +28,6 @@ class GPTQ:
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
-        self.bh4 = BH4(in_dim=self.rows, out_dim=self.rows, block_size=16, decay_coeff = 0.7)
-        self.bh4_lr = 30e-2
 
     # def preproc(self, preproc_gptqH=False, percdamp=.01,
     #             preproc_rescale=False, preproc_proj=False, preproc_proj_extra=0):
@@ -134,148 +132,145 @@ class GPTQ:
     def fasterquant(
         self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False
     ):
-        W = self.layer.weight.data.clone()
-        # # project onto TFF
-        W = torch.matmul(self.tff, W)
-        if isinstance(self.layer, nn.Conv2d):
-            W = W.flatten(1)
-        if isinstance(self.layer, transformers.Conv1D):
-            W = W.t()
-        W = W.float()
+        with torch.no_grad():
+            W = self.layer.weight.data.clone()
+            # # project onto TFF
+            W = torch.matmul(self.tff, W)
+            if isinstance(self.layer, nn.Conv2d):
+                W = W.flatten(1)
+            if isinstance(self.layer, transformers.Conv1D):
+                W = W.t()
+            W = W.float()
 
-        tick = time.time()
+            tick = time.time()
 
-        if not self.quantizer.ready():
-            self.quantizer.find_params(W, weight=True)
+            if not self.quantizer.ready():
+                self.quantizer.find_params(W, weight=True)
 
-        H = self.H
-        del self.H
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        W[:, dead] = 0
+            H = self.H
+            del self.H
+            dead = torch.diag(H) == 0
+            H[dead, dead] = 1
+            W[:, dead] = 0
 
-        if static_groups:
-            import copy
-            groups = []
-            for i in range(0, self.columns, groupsize):
-                quantizer = copy.deepcopy(self.quantizer)
-                quantizer.find_params(W[:, i:(i + groupsize)], weight=True)
-                groups.append(quantizer)
+            if static_groups:
+                import copy
+                groups = []
+                for i in range(0, self.columns, groupsize):
+                    quantizer = copy.deepcopy(self.quantizer)
+                    quantizer.find_params(W[:, i:(i + groupsize)], weight=True)
+                    groups.append(quantizer)
 
-        if actorder:
-            perm = torch.argsort(torch.diag(H), descending=True)
-            W = W[:, perm]
-            H = H[perm][:, perm]
-            invperm = torch.argsort(perm)
+            if actorder:
+                perm = torch.argsort(torch.diag(H), descending=True)
+                W = W[:, perm]
+                H = H[perm][:, perm]
+                invperm = torch.argsort(perm)
 
-        Losses = torch.zeros_like(W)
-        Q = torch.zeros_like(W)
+            Losses = torch.zeros_like(W)
+            Q = torch.zeros_like(W)
 
-        damp = percdamp * torch.mean(torch.diag(H))
-        diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+            damp = percdamp * torch.mean(torch.diag(H))
+            diag = torch.arange(self.columns, device=self.dev)
+            H[diag, diag] += damp
+            H = torch.linalg.cholesky(H)
+            H = torch.cholesky_inverse(H)
+            H = torch.linalg.cholesky(H, upper=True)
+            Hinv = H
 
-        for i1 in range(0, self.columns, blocksize):
-            i2 = min(i1 + blocksize, self.columns)
-            count = i2 - i1
+            for i1 in range(0, self.columns, blocksize):
+                i2 = min(i1 + blocksize, self.columns)
+                count = i2 - i1
 
-            W1 = W[:, i1:i2].clone()
-            Q1 = torch.zeros_like(W1)
-            Err1 = torch.zeros_like(W1)
-            Losses1 = torch.zeros_like(W1)
-            Hinv1 = Hinv[i1:i2, i1:i2]
+                W1 = W[:, i1:i2].clone()
+                Q1 = torch.zeros_like(W1)
+                Err1 = torch.zeros_like(W1)
+                Losses1 = torch.zeros_like(W1)
+                Hinv1 = Hinv[i1:i2, i1:i2]
 
-            for i in range(count):
-                w = W1[:, i]
-                d = Hinv1[i, i]
+                for i in range(count):
+                    w = W1[:, i]
+                    d = Hinv1[i, i]
 
-                if groupsize != -1:
-                    if not static_groups:
-                        if (i1 + i) % groupsize == 0:
-                            self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
-                    else:
-                        idx = i1 + i
-                        if actorder:
-                            idx = perm[idx]
-                        self.quantizer = groups[idx // groupsize]
+                    if groupsize != -1:
+                        if not static_groups:
+                            if (i1 + i) % groupsize == 0:
+                                self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
+                        else:
+                            idx = i1 + i
+                            if actorder:
+                                idx = perm[idx]
+                            self.quantizer = groups[idx // groupsize]
 
-                q = quantize(
-                    w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
-                ).flatten()
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d ** 2
+                    q = quantize(
+                        w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
+                    ).flatten()
+                    Q1[:, i] = q
+                    Losses1[:, i] = (w - q) ** 2 / d ** 2
 
-                err1 = (w - q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
+                    err1 = (w - q) / d
+                    W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                    Err1[:, i] = err1
 
-            Q[:, i1:i2] = Q1
-            Losses[:, i1:i2] = Losses1 / 2
+                Q[:, i1:i2] = Q1
+                Losses[:, i1:i2] = Losses1 / 2
 
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+                W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
-            if DEBUG:
-                self.layer.weight.data[:, :i2] = Q[:, :i2]
-                self.layer.weight.data[:, i2:] = W[:, i2:]
-                print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-                print(torch.sum(Losses))
+                if DEBUG:
+                    self.layer.weight.data[:, :i2] = Q[:, :i2]
+                    self.layer.weight.data[:, i2:] = W[:, i2:]
+                    print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+                    print(torch.sum(Losses))
 
-        torch.cuda.synchronize()
-        print('time %.2f' % (time.time() - tick))
-        print('error', torch.sum(Losses).item())
+            torch.cuda.synchronize()
+            print('time %.2f' % (time.time() - tick))
+            print('error', torch.sum(Losses).item())
 
-        if actorder:
-            Q = Q[:, invperm]
+            if actorder:
+                Q = Q[:, invperm]
 
-        if isinstance(self.layer, transformers.Conv1D):
-            Q = Q.t()
-        # # naive reconstruction
-        # self.layer.weight.data = self.tff.T @ Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        # # using the full blown Weiner Filter
-        Q = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        self.inps = torch.stack(self.inps, dim=0).permute(0,2,1)
-        x = nn.functional.linear(self.inps, self.layer.weight.data).view(-1, self.rows).T
-        z = nn.functional.linear(self.inps, Q).view(-1, self.rows).T
-        Rxz = x @ z.T
-        Rzz = z @ z.T
-        Weiner_F = Rxz @ torch.linalg.pinv(Rzz)
+            if isinstance(self.layer, transformers.Conv1D):
+                Q = Q.t()
+            # # naive reconstruction
+            # self.layer.weight.data = self.tff.T @ Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+            # # using the full blown Weiner Filter
+            Q = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+            self.inps = torch.stack(self.inps, dim=0).permute(0,2,1)
+            x = nn.functional.linear(self.inps, self.layer.weight.data).view(-1, self.rows).T
+            z = nn.functional.linear(self.inps, Q).view(-1, self.rows).T
+            Rxz = x @ z.T
+            Rzz = z @ z.T
+            Weiner_F = Rxz @ torch.linalg.pinv(Rzz)
+
         # do the bh4 approximation
+        aprx_bh4 = BH4(in_dim=self.rows, out_dim=self.rows, block_size=16, decay_coeff = 0.7)
+        bh4_lr = 30e-2
         criterion = nn.MSELoss()
-        optimizer = torch.optim.SGD(self.bh4.parameters(),
-                                lr=self.bh4_lr,
+        optimizer = torch.optim.SGD(aprx_bh4.parameters(),
+                                lr=bh4_lr,
                                 momentum=0.9,
                                 weight_decay=0)
-        self.bh4 = self.bh4.to(self.dev)
-        self.bh4.zero_grad()
-        self.bh4.train()
+        aprx_bh4 = aprx_bh4.to(self.dev)
+        aprx_bh4.zero_grad()
+        aprx_bh4.train()
         true_outs = (Weiner_F @ Q).T
         for epoch in range(1):
-            outs = self.bh4(Q.T)
+            outs = aprx_bh4(Q.T)
             loss = criterion(true_outs, outs)
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
 
         print(f'{epoch = }, loss = {loss.item()}')
+        aprx_bh4.eval()
 
-        self.bh4.eval()
-        del optimizer ,criterion ,x ,z , Rxz, Rzz, Weiner_F
-        torch.cuda.empty_cache()
-
-
-        # Import matplotlib.pyplot as plt
-        # Plt.plot(losses)
-        # Plt.savefig('temp.png')
-        # plt.close()
-        # breakpoint()
         # using the full Weiner filter
         # self.layer.weight.data = Weiner_F @ Q
         # using the BH4 version
-        self.layer.weight.data = self.bh4(Q.T).T
+        self.layer.weight.data = aprx_bh4(Q.T).T
+        del optimizer ,criterion ,x ,z , Rxz, Rzz, Weiner_F, apprx_bh4
+        torch.cuda.empty_cache()
         # # using gptq alone
         # self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         # if DEBUG:

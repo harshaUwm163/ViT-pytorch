@@ -114,63 +114,61 @@ def valid(args, model, writer, test_loader, global_step):
 
 # @torch.no_grad()
 def quantize_vit(model, dataloader, dev, args):
-    print('Starting ...')
+    with torch.no_grad():
+        print('Starting ...')
 
-    layers = model.transformer.encoder.layer
+        layers = model.transformer.encoder.layer
 
-    for batch in dataloader:
-        inps = model.transformer.embeddings(batch[0].to(device))
-        break
+        for batch in dataloader:
+            inps = model.transformer.embeddings(batch[0].to(device))
+            break
 
-    tffs = {}
-    k_attn = int(96 * args.tff_redundancy)
-    l_attn = 8
-    n_attn = 768
-    tffs[n_attn] = construct_real_tff(k_attn, l_attn // 2, n_attn // 2).to(dev)
+        tffs = {}
+        k_attn = int(96 * args.tff_redundancy)
+        l_attn = 8
+        n_attn = 768
+        tffs[n_attn] = construct_real_tff(k_attn, l_attn // 2, n_attn // 2).to(dev)
 
-    k_mlp = int(384 * args.tff_redundancy)
-    l_mlp = 8
-    n_mlp = 3072
-    tffs[n_mlp] = construct_real_tff(k_mlp, l_mlp // 2, n_mlp // 2).to(dev)
+        k_mlp = int(384 * args.tff_redundancy)
+        l_mlp = 8
+        n_mlp = 3072
+        tffs[n_mlp] = construct_real_tff(k_mlp, l_mlp // 2, n_mlp // 2).to(dev)
 
-    outs = torch.zeros_like(inps)
-    print('Ready.')
+        outs = torch.zeros_like(inps)
+        print('Ready.')
 
     quantizers = {}
     for i in range(len(layers)):
-        layer = layers[i].to(dev)
+        with torch.no_grad():
+            layer = layers[i].to(dev)
 
-        subset = find_layers(layer)
-        gptq = {}
-        for name in subset:
-            gptq[name] = GPTQ(subset[name])
-            gptq[name].quantizer = Quantizer()
-            gptq[name].quantizer.configure(
-                args.wbits, perchannel=True, sym=args.sym, mse=False, trits=args.trits
-            )
-            tff_n = subset[name].weight.shape[0]
-            gptq[name].tff = tffs[tff_n].view(-1, tff_n)
-            gptq[name].inps = []
+            subset = find_layers(layer)
+            gptq = {}
+            for name in subset:
+                gptq[name] = GPTQ(subset[name])
+                gptq[name].quantizer = Quantizer()
+                gptq[name].quantizer.configure(
+                    args.wbits, perchannel=True, sym=args.sym, mse=False, trits=args.trits
+                )
+                tff_n = subset[name].weight.shape[0]
+                gptq[name].tff = tffs[tff_n].view(-1, tff_n)
+                gptq[name].inps = []
 
-        def add_batch(name):
-            def tmp(_, inp, out):
-                gptq[name].add_batch(inp[0].data, out.data)
-            return tmp
-        handles = []
-        for name in subset:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
-        for j in range(args.train_batch_size):
-            outs[j] = layer(inps[j].unsqueeze(0))[0]
-        for h in handles:
-            h.remove()
+            def add_batch(name):
+                def tmp(_, inp, out):
+                    gptq[name].add_batch(inp[0].data, out.data)
+                return tmp
+            handles = []
+            for name in subset:
+                handles.append(subset[name].register_forward_hook(add_batch(name)))
+            for j in range(args.train_batch_size):
+                outs[j] = layer(inps[j].unsqueeze(0))[0]
+            for h in handles:
+                h.remove()
 
         for name in subset:
             print(i, name)
             print(f'Quantizing {name} ...')
-            # quant_method[name].preproc(
-            #         preproc_gptqH=args.pre_gptqH, percdamp=args.percdamp,
-            #         preproc_rescale=args.pre_rescale, 
-            #         preproc_proj=args.pre_proj, preproc_proj_extra=args.pre_proj_extra)
             gptq[name].fasterquant(
                 percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
             )

@@ -33,7 +33,7 @@ def bh4_cuda(x, w):
             y = y.reshape(B, NB, BS)
             y = torch.einsum("bni,noi->bno", y, w[i, j])
             y = y.reshape(B, D)
-            y = hadamard(y)
+            y = hadamard(y, True)
         out.append(y)
     return torch.stack(out, dim = -1)
 
